@@ -14,6 +14,7 @@ from telethon.errors import (
     PasswordHashInvalidError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
+    PhoneNumberInvalidError,
     SessionPasswordNeededError,
 )
 from telethon.tl.types import User
@@ -43,6 +44,18 @@ class PasswordRequired(UserbotError):
 
 class InvalidPassword(UserbotError):
     pass
+
+
+class InvalidPhoneNumber(UserbotError):
+    pass
+
+
+class RateLimited(UserbotError):
+    def __init__(self, seconds: int) -> None:
+        self.seconds = seconds
+        super().__init__(
+            f"Telegram ограничил запросы. Повторите через {seconds} секунд."
+        )
 
 
 def trigger_matches(trigger: Trigger, text: str) -> bool:
@@ -78,18 +91,23 @@ class UserbotManager:
         self._watchdog_task: asyncio.Task[None] | None = None
         self._stopping = False
 
-    def _new_client(self) -> TelegramClient:
+    def _new_client(
+        self,
+        session_path: Path | str | None = None,
+        add_handler: bool = True,
+    ) -> TelegramClient:
         client = TelegramClient(
-            str(self.session_path),
+            str(session_path or self.session_path),
             self.api_id,
             self.api_hash,
             auto_reconnect=True,
             connection_retries=5,
             retry_delay=3,
         )
-        client.add_event_handler(
-            self._on_new_message, events.NewMessage(incoming=True)
-        )
+        if add_handler:
+            client.add_event_handler(
+                self._on_new_message, events.NewMessage(incoming=True)
+            )
         return client
 
     async def start(self) -> None:
@@ -110,55 +128,89 @@ class UserbotManager:
             self._watchdog_task = None
         await self._discard_client()
 
-    async def begin_login(self, phone: str) -> None:
+    async def begin_login(self, phone: str) -> str:
         account = await self.database.get_account()
         if account is not None:
             raise UserbotError("Аккаунт уже добавлен")
         await self._discard_client()
-        self.client = self._new_client()
+        client = self._new_client(add_handler=False)
         try:
-            await self.client.connect()
-            sent = await self.client.send_code_request(phone)
-        except Exception:
-            await self._discard_client()
-            raise
+            await client.connect()
+            sent = await client.send_code_request(phone)
+        except PhoneNumberInvalidError as error:
+            raise InvalidPhoneNumber("Неверный номер телефона") from error
+        except FloodWaitError as error:
+            raise RateLimited(error.seconds) from error
+        finally:
+            await client.disconnect()
+        if not sent.phone_code_hash:
+            raise UserbotError("Telegram не вернул phone_code_hash")
         self.pending_phone = phone
         self.pending_phone_code_hash = sent.phone_code_hash
+        return sent.phone_code_hash
 
-    async def submit_code(self, code: str) -> User:
-        if (
-            self.client is None
-            or self.pending_phone is None
-            or self.pending_phone_code_hash is None
-        ):
+    async def submit_code(
+        self,
+        phone: str,
+        code: str,
+        phone_code_hash: str,
+        session_path: Path | str | None = None,
+    ) -> User:
+        if not phone or not phone_code_hash:
             raise UserbotError("Авторизация не была начата")
+        await self._discard_client()
+        client = self._new_client(session_path=session_path, add_handler=True)
         try:
-            user = await self.client.sign_in(
-                phone=self.pending_phone,
+            await client.connect()
+            user = await client.sign_in(
+                phone=phone,
                 code=code,
-                phone_code_hash=self.pending_phone_code_hash,
+                phone_code_hash=phone_code_hash,
             )
         except PhoneCodeInvalidError as error:
-            raise InvalidCode("Неверный код") from error
+            await client.disconnect()
+            raise InvalidCode("Код неверный") from error
         except PhoneCodeExpiredError as error:
-            raise ExpiredCode("Срок действия кода истёк") from error
+            await client.disconnect()
+            raise ExpiredCode("Код истёк") from error
+        except FloodWaitError as error:
+            await client.disconnect()
+            raise RateLimited(error.seconds) from error
         except SessionPasswordNeededError as error:
+            self.client = client
+            self.pending_phone = phone
+            self.pending_phone_code_hash = phone_code_hash
             raise PasswordRequired("Нужен облачный пароль") from error
-        await self._finish_login(user)
+        user = await client.get_me()
+        self.client = client
+        await self._finish_login(user, phone=phone)
         return user
 
-    async def submit_password(self, password: str) -> User:
-        if self.client is None or self.pending_phone is None:
-            raise UserbotError("Авторизация не была начата")
+    async def submit_password(
+        self,
+        password: str,
+        session_path: Path | str | None = None,
+        phone: str | None = None,
+    ) -> User:
+        if self.client is None or not self.client.is_connected():
+            await self._discard_client()
+            self.client = self._new_client(
+                session_path=session_path,
+                add_handler=True,
+            )
+            await self.client.connect()
         try:
-            user = await self.client.sign_in(password=password)
+            await self.client.sign_in(password=password)
         except PasswordHashInvalidError as error:
             raise InvalidPassword("Неверный облачный пароль") from error
-        await self._finish_login(user)
+        except FloodWaitError as error:
+            raise RateLimited(error.seconds) from error
+        user = await self.client.get_me()
+        await self._finish_login(user, phone=phone)
         return user
 
-    async def _finish_login(self, user: User) -> None:
-        phone = self.pending_phone or getattr(user, "phone", None) or ""
+    async def _finish_login(self, user: User, phone: str | None = None) -> None:
+        phone = phone or self.pending_phone or getattr(user, "phone", None) or ""
         await self.database.save_account(
             phone=phone,
             user_id=user.id,
@@ -222,9 +274,7 @@ class UserbotManager:
 
     async def resolve_dialog(self, chat_id: int) -> str:
         if self.client is None or not self.client.is_connected():
-            raise UserbotError(
-                "Пользовательский аккаунт не подключён"
-            )
+            raise UserbotError("Пользовательский аккаунт не подключён")
         if not await self.client.is_user_authorized():
             raise UserbotError(
                 "Сессия пользовательского аккаунта не авторизована"
@@ -327,7 +377,9 @@ class UserbotManager:
             try:
                 if not trigger_matches(trigger, event.raw_text):
                     continue
-                await self._respond_once(event, trigger, settings["cooldown_seconds"])
+                await self._respond_once(
+                    event, trigger, settings["cooldown_seconds"]
+                )
                 return
             except FloodWaitError as error:
                 await self.notify(

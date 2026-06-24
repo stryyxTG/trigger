@@ -2,7 +2,7 @@ import unittest
 
 from aiogram.types import InlineKeyboardMarkup
 
-from bot import trigger_card_text
+from trigger import normalize_login_code, trigger_card_text
 from database import MAX_TRIGGER_CHATS, Trigger, TriggerChat
 from keyboards import (
     account_menu,
@@ -80,6 +80,10 @@ class BotInterfaceTests(unittest.TestCase):
                 "menu",
             ],
         )
+
+    def test_login_code_normalization(self) -> None:
+        self.assertEqual(normalize_login_code("12 3-45"), "12345")
+        self.assertEqual(normalize_login_code("код: 9 8 7"), "987")
 
 
 if __name__ == "__main__":
